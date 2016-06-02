@@ -134,6 +134,8 @@ func runCommand(cmd string) (err error) {
 		return errors.Trace(cmdBenchmarkSet())
 	case "set1":
 		return errors.Trace(cmdBenchmarkSetNoAck())
+	case "set2":
+		return errors.Trace(cmdBenchmarkSet2())
 	}
 	return errors.NotSupportedf("See 'go_kafka_client_benchmark -h', command %s", cmd)
 }
@@ -186,7 +188,7 @@ func cmdBenchmarkSet() error {
 				return nil
 			}
 			return recordMetadata.Error
-		})
+		}, nil)
 	return errors.Trace(bt.Run())
 }
 
@@ -232,7 +234,7 @@ func cmdBenchmarkSetNoAck() error {
 				return nil
 			}
 			return recordMetadata.Error
-		})
+		}, nil)
 	return errors.Trace(bt.Run())
 }
 
@@ -282,7 +284,7 @@ func cmdBenchmarkGet() error {
 
 		<-message
 		return nil
-	})
+	}, nil)
 
 	return errors.Trace(bt.Run())
 }

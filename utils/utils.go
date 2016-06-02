@@ -18,6 +18,7 @@ package utils
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/juju/errors"
 )
@@ -36,4 +37,56 @@ func GetIntFromArgs(args map[string]interface{}, arg string, defaultVar int) (in
 		return v, errors.Trace(err)
 	}
 	return defaultVar, nil
+}
+
+func ValidParam(str string) bool {
+	return !strings.Contains(str, " ") && !BlankString(str)
+}
+
+func BlankString(str string) bool {
+	if len(strings.TrimSpace(str)) == 0 {
+		return true
+	} else {
+		return false
+	}
+}
+
+func BytesToUint64(bytes []byte) uint64 {
+	u := uint64(0)
+	l := len(bytes)
+	if l == 0 {
+		return uint64(0)
+	}
+	u = u | uint64(bytes[l-1])
+	for i := l - 1; i >= 0; i-- {
+		u = u<<8 | uint64(bytes[i])
+	}
+	return u
+}
+
+func Uint64ToBytes(u uint64) []byte {
+	bytes := make([]byte, 8)
+	bytes[0] = byte(u)
+	bytes[1] = byte(u >> 8)
+	bytes[2] = byte(u >> 16)
+	bytes[3] = byte(u >> 24)
+	bytes[4] = byte(u >> 32)
+	bytes[5] = byte(u >> 40)
+	bytes[6] = byte(u >> 48)
+	bytes[7] = byte(u >> 56)
+	return bytes
+}
+
+type Int32Slice []int32
+
+func (slice Int32Slice) Len() int {
+	return len(slice)
+}
+
+func (slice Int32Slice) Less(i, j int) bool {
+	return slice[i] < slice[j]
+}
+
+func (slice Int32Slice) Swap(i, j int) {
+	slice[i], slice[j] = slice[j], slice[i]
 }

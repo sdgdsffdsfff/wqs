@@ -17,118 +17,103 @@ limitations under the License.
 package zookeeper
 
 import (
-	"container/list"
-	"strings"
+	"fmt"
+	"path"
 	"time"
 
+	"github.com/juju/errors"
 	"github.com/samuel/go-zookeeper/zk"
+	"github.com/weibocom/wqs/log"
 )
-
-type ZkClient struct {
-	conn *zk.Conn
-}
 
 const defaultVersion = -1
 
-func NewZkClient(servers []string) *ZkClient {
-	zkClient := ZkClient{}
-	c, _, err := zk.Connect(servers, time.Second)
-	if err != nil {
-		panic(err)
-	}
-	zkClient.conn = c
-	return &zkClient
+//For dup package github.com/samuel/go-zookeeper/zk log print
+type logger struct {
 }
 
-//创建节点
-func (this *ZkClient) Create(path string, data string) bool {
-	flags := int32(0)
-	acl := zk.WorldACL(zk.PermAll)
-	_, err := this.conn.Create(path, []byte(data), flags, acl)
+func (l logger) Printf(format string, a ...interface{}) {
+	log.Info("[zk] ", fmt.Sprintf(format, a...))
+}
+
+type ZkClient struct {
+	*zk.Conn
+}
+
+func zkClientSetLogger(c *zk.Conn) {
+	c.SetLogger(logger{})
+}
+
+func NewZkClient(servers []string) (*ZkClient, error) {
+	c, _, err := zk.Connect(servers, time.Second, zkClientSetLogger)
 	if err != nil {
-		return false
+		return nil, errors.Trace(err)
 	}
-	return true
+
+	return &ZkClient{Conn: c}, nil
+}
+
+//Create a node by path with data.
+func (z *ZkClient) Create(path string, data string, flags int32) error {
+	_, err := z.Conn.Create(path, []byte(data), flags, zk.WorldACL(zk.PermAll))
+	return err
 }
 
 //递归创建节点
-func (this *ZkClient) CreateRec(path string, data string) bool {
-	flags := int32(0)
-	acl := zk.WorldACL(zk.PermAll)
-
-	path_array := strings.Split(path[1:len(path)], "/")
-	var temp_path string
-	for _, p := range path_array {
-		temp_path += ("/" + p)
-		if this.Exists(temp_path) {
-			continue
+func (z *ZkClient) CreateRec(zkPath string, data string, flags int32) error {
+	err := z.Create(zkPath, data, flags)
+	if err == zk.ErrNoNode {
+		err = z.CreateRec(path.Dir(zkPath), "", flags)
+		if err != nil && err != zk.ErrNodeExists {
+			return err
 		}
-		this.conn.Create(temp_path, nil, flags, acl)
+		err = z.Create(zkPath, data, flags)
 	}
-	this.conn.Set(path, []byte(data), defaultVersion)
-	return true
+	return err
 }
 
-//删除节点
-func (this *ZkClient) Delete(path string) bool {
-	err := this.conn.Delete(path, defaultVersion)
-	if err != nil {
-		return false
-	}
-	return true
+//Delete a node by path.
+func (z *ZkClient) Delete(path string) error {
+	return z.Conn.Delete(path, defaultVersion)
 }
 
 //递归删除
-func (this *ZkClient) DeleteRec(path string) bool {
-	l := list.New()
-	l.PushBack(path)
-	for l.Len() != 0 {
-		element := l.Back()
-		str, _ := element.Value.(string)
-		children, _ := this.Children(str)
-		if len(children) != 0 {
-			for _, child := range children {
-				l.PushBack(str + "/" + child)
-			}
-		} else {
-			this.Delete(str)
-			l.Remove(element)
+func (z *ZkClient) DeleteRec(zkPath string) error {
+
+	err := z.Delete(zkPath)
+	if err == nil {
+		return nil
+	}
+	if err != zk.ErrNotEmpty {
+		return err
+	}
+
+	children, _, err := z.Children(zkPath)
+	if err != nil {
+		return err
+	}
+	for _, child := range children {
+		err = z.DeleteRec(path.Join(zkPath, child))
+		if err != nil {
+			return err
 		}
 	}
-	return true
+
+	return z.Delete(zkPath)
 }
 
-func (this *ZkClient) Set(path string, data string) bool {
-	if !this.Exists(path) {
-		return false
-	}
-	_, err := this.conn.Set(path, []byte(data), defaultVersion)
+func (z *ZkClient) Set(path string, data string) error {
+	_, err := z.Conn.Set(path, []byte(data), defaultVersion)
+	return err
+}
+
+func (z *ZkClient) HasChildren(path string) (bool, error) {
+	children, _, err := z.Conn.Children(path)
 	if err != nil {
-		return false
+		return false, errors.Trace(err)
 	}
-	return true
-}
-
-func (this *ZkClient) Exists(path string) bool {
-	result, _, _ := this.conn.Exists(path)
-	return result
-}
-
-func (this *ZkClient) Children(path string) ([]string, *zk.Stat) {
-	children, stat, _ := this.conn.Children(path)
-	return children, stat
-}
-
-func (this *ZkClient) Get(path string) (string, *zk.Stat) {
-	value, stat, _ := this.conn.Get(path)
-	data := string(value)
-	return data, stat
-}
-
-func (this *ZkClient) HasChildren(path string) bool {
-	children, _, _ := this.conn.Children(path)
 	if len(children) == 0 {
-		return false
+		return false, nil
 	}
-	return true
+	return true, nil
 }

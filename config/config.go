@@ -18,106 +18,169 @@ limitations under the License.
 package config
 
 import (
+	"time"
+
+	"github.com/weibocom/wqs/config/ext"
+
 	"github.com/juju/errors"
-	"github.com/magiconair/properties"
 )
 
 type Config struct {
-	ZookeeperAddr      string
-	BrokerAddr         string
+	*ext.Config
+	KafkaZKAddr       string
+	KafkaZKRoot       string
+	KafkaPartitions   int
+	KafkaReplications int
+
+	ProxyId            int
+	UiDir              string
 	HttpPort           string
 	McPort             string
 	McSocketRecvBuffer int
 	McSocketSendBuffer int
 	MotanPort          string
-	UiDir              string
-	PartitionsNum      int
-	ReplicationsNum    int
+	MetaDataZKAddr     string
+	MetaDataZKRoot     string
 	RedisAddr          string
-}
-
-func NewConfig() *Config {
-	return &Config{
-		ZookeeperAddr:      "localhost:2181",
-		BrokerAddr:         "localhost:9092",
-		HttpPort:           "8080",
-		McPort:             "11211",
-		MotanPort:          "8881",
-		UiDir:              "./ui",
-		PartitionsNum:      16,
-		ReplicationsNum:    2,
-		RedisAddr:          "localhost:6379",
-		McSocketRecvBuffer: 4096,
-		McSocketSendBuffer: 4096,
-	}
+	LogInfo            string
+	LogDebug           string
+	LogProfile         string
+	LogExpire          string
 }
 
 func NewConfigFromFile(file string) (*Config, error) {
-
-	p, err := properties.LoadFile(file, properties.UTF8)
+	cfg, err := ext.NewConfig(file, time.Second*0)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
-	httpPort, exist := p.Get("http.port")
-	if !exist {
-		return nil, errors.NotFoundf("http.port")
+	// kafka cluster config
+	kafkaSec, err := cfg.GetSection("kafka")
+	if err != nil {
+		return nil, err
+	}
+	kafkaZKAddr, err := kafkaSec.GetString("zookeeper.connect")
+	if err != nil {
+		return nil, errors.NotFoundf("kafka.zookeeper.connect")
+	}
+	kafkaZKRoot, err := kafkaSec.GetString("zookeeper.root")
+	if err != nil {
+		return nil, errors.NotFoundf("kafka.zookeeper.root")
 	}
 
-	uiDir, exist := p.Get("ui.dir")
-	if !exist {
+	kafkaPartitions := int(kafkaSec.GetInt64Must("topic.partitions", 0))
+	if kafkaPartitions == 0 {
+		return nil, errors.NotValidf("kafka.topic.partitions")
+	}
+	kafkaReplications := int(kafkaSec.GetInt64Must("topic.replications", 0))
+	if kafkaReplications == 0 {
+		return nil, errors.NotValidf("kafka.topic.replications")
+	}
+
+	// proxy config
+	proxySec, err := cfg.GetSection("proxy")
+	if err != nil {
+		return nil, err
+	}
+	proxyId := int(proxySec.GetInt64Must("id", -1))
+	if proxyId == -1 {
+		return nil, errors.NotValidf("proxy.id")
+	}
+
+	uiSec, err := cfg.GetSection("ui")
+	if err != nil {
+		return nil, err
+	}
+	uiDir, err := uiSec.GetString("dir")
+	if err != nil {
 		return nil, errors.NotFoundf("ui.dir")
 	}
 
-	zookeeperAddr, exist := p.Get("zookeeper.connect")
-	if !exist {
-		return nil, errors.NotFoundf("zookeeper.connect")
+	pSec, err := cfg.GetSection("protocol")
+	if err != nil {
+		return nil, err
 	}
 
-	brokerAddr, exist := p.Get("broker.connect")
-	if !exist {
-		return nil, errors.NotFoundf("broker.connect")
+	httpPort, err := pSec.GetString("http.port")
+	if err != nil {
+		return nil, errors.NotFoundf("protocol.http.port")
 	}
 
-	partitionsNum := int(p.GetInt64("partitions.num", 0))
-	if partitionsNum == 0 {
-		return nil, errors.NotValidf("partitions.num")
+	mcPort, err := pSec.GetString("mc.port")
+	if err != nil {
+		return nil, errors.NotFoundf("protocol.mc.port")
+	}
+	mcSocketRecvBuffer := int(pSec.GetInt64Must("mc.socket.buffer.recv", 4096))
+	mcSocketSendBuffer := int(pSec.GetInt64Must("mc.socket.buffer.send", 4096))
+
+	motanPort, err := pSec.GetString("motan.port")
+	if err != nil {
+		return nil, errors.NotFoundf("protocol.motan.port")
 	}
 
-	replicationsNum := int(p.GetInt64("replications.num", -1))
-	if replicationsNum == -1 {
-		return nil, errors.NotValidf("replications.num")
+	metaSec, err := cfg.GetSection("metadata")
+	if err != nil {
+		return nil, errors.NotFoundf("metadata sec")
 	}
 
-	redisAddr, exist := p.Get("redis.connect")
-	if !exist {
-		return nil, errors.NotFoundf("redis.connect")
+	metaDataZKAddr, err := metaSec.GetString("zookeeper.connect")
+	if err != nil {
+		return nil, errors.NotFoundf("metadata.zookeeper.connect")
+	}
+	metaDataZKRoot, err := metaSec.GetString("zookeeper.root")
+	if err != nil {
+		return nil, errors.NotFoundf("metadata.zookeeper.root")
 	}
 
-	mcPort, exist := p.Get("mc.port")
-	if !exist {
-		return nil, errors.NotFoundf("mc.port")
+	sec, err := cfg.GetSection("redis")
+	if err != nil {
+		return nil, errors.NotFoundf("redis sec")
+	}
+	redisAddr, err := sec.GetString("connect")
+	if err != nil {
+		return nil, errors.NotFoundf("redis")
 	}
 
-	motanPort, exist := p.Get("motan.port")
-	if !exist {
-		return nil, errors.NotFoundf("motan.port")
+	logSec, err := cfg.GetSection("log")
+	if err != nil {
+		return nil, errors.NotFoundf("log sec")
 	}
-
-	mcSocketRecvBuffer := int(p.GetInt64("mc.socket.recv.buffer", 4096))
-	mcSocketSendBuffer := int(p.GetInt64("mc.socket.send.buffer", 4096))
+	logInfo, err := logSec.GetString("info")
+	if err != nil {
+		return nil, errors.NotFoundf("log.info")
+	}
+	logDebug, err := logSec.GetString("debug")
+	if err != nil {
+		return nil, errors.NotFoundf("log.debug")
+	}
+	logProfile, err := logSec.GetString("profile")
+	if err != nil {
+		return nil, errors.NotFoundf("log.profile")
+	}
+	logExpire, err := logSec.GetString("expire")
+	if err != nil {
+		logExpire = "72h"
+	}
 
 	return &Config{
-		HttpPort:           httpPort,
+		KafkaZKAddr:        kafkaZKAddr,
+		KafkaZKRoot:        kafkaZKRoot,
+		KafkaPartitions:    kafkaPartitions,
+		KafkaReplications:  kafkaReplications,
+		ProxyId:            proxyId,
 		UiDir:              uiDir,
-		ZookeeperAddr:      zookeeperAddr,
-		BrokerAddr:         brokerAddr,
-		PartitionsNum:      partitionsNum,
-		ReplicationsNum:    replicationsNum,
-		RedisAddr:          redisAddr,
+		HttpPort:           httpPort,
 		McPort:             mcPort,
-		MotanPort:          motanPort,
 		McSocketRecvBuffer: mcSocketRecvBuffer,
 		McSocketSendBuffer: mcSocketSendBuffer,
+		MotanPort:          motanPort,
+		MetaDataZKAddr:     metaDataZKAddr,
+		MetaDataZKRoot:     metaDataZKRoot,
+		RedisAddr:          redisAddr,
+		LogInfo:            logInfo,
+		LogDebug:           logDebug,
+		LogProfile:         logProfile,
+		LogExpire:          logExpire,
+		Config:             cfg,
 	}, nil
 }

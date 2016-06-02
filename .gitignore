@@ -22,6 +22,7 @@ target/
 *.diff
 *.patch
 *.tmp
+*.swp
 .svn/
 
 # system ignore
@@ -36,4 +37,3 @@ qservice
 bin
 COMMENT_LICENSE
 *.jar
-ui
