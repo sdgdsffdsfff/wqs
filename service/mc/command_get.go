@@ -21,14 +21,13 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/juju/errors"
 	"github.com/weibocom/wqs/engine/kafka"
 	"github.com/weibocom/wqs/engine/queue"
 )
 
 const (
-	GET_NAME  = "get"
-	EGET_NAME = "eget"
+	cmdGet  = "get"
+	cmdEget = "eget"
 )
 
 type pair struct {
@@ -41,47 +40,48 @@ type pair struct {
 }
 
 func init() {
-	registerCommand(GET_NAME, commandGet)
-	registerCommand(EGET_NAME, commandGet)
+	registerCommand(cmdGet, commandGet)
+	registerCommand(cmdEget, commandGet)
 }
 
-func commandGet(q queue.Queue, tokens []string, r *bufio.Reader, w *bufio.Writer) error {
+func commandGet(q queue.Queue, tokens []string, r *bufio.Reader, w *bufio.Writer) bool {
 
 	fields := len(tokens)
 	if fields < 2 {
-		fmt.Fprint(w, ERROR)
-		return errors.NotValidf("mc tokens %v ", tokens)
+		w.WriteString(respError)
+		return true
 	}
+
 	cmd := tokens[0]
-	keyValues := make([]pair, 0)
+	pairs := make([]pair, 0, 1)
 	for _, key := range tokens[1:] {
-		k := strings.Split(key, ".")
+		k := strings.SplitN(key, ".", 2)
 		queue := k[0]
 		group := defaultGroup
-		if len(k) > 1 {
+		if len(k) == 2 {
 			group = k[0]
 			queue = k[1]
 		}
 
 		id, data, flag, err := q.RecvMessage(queue, group)
 		if err != nil {
-			if errors.Cause(err) == kafka.ErrTimeout {
-				w.WriteString(END)
+			if err == kafka.ErrTimeout {
+				w.WriteString(respEnd)
 			} else {
-				fmt.Fprintf(w, "%s %s\r\n", ENGINE_ERROR_PREFIX, err)
+				fmt.Fprintf(w, "%s %s\r\n", respEngineErrorPrefix, err)
 			}
-			return nil
+			return false
 		}
-		// eset data : idlen id data
-		if strings.EqualFold(cmd, EGET_NAME) {
+		// eget data : idlen id data
+		if cmd == cmdEget {
 			idLen := (byte)(len(id))
-			esetData := make([]byte, 0)
-			esetData = append(esetData, idLen)
-			esetData = append(esetData, ([]byte)(id)...)
-			data = append(esetData, data...)
+			egetData := make([]byte, 0, 1024)
+			egetData = append(egetData, idLen)
+			egetData = append(egetData, id...)
+			data = append(egetData, data...)
 		}
 
-		keyValues = append(keyValues, pair{
+		pairs = append(pairs, pair{
 			key:   key,
 			queue: queue,
 			group: group,
@@ -91,14 +91,14 @@ func commandGet(q queue.Queue, tokens []string, r *bufio.Reader, w *bufio.Writer
 		})
 	}
 
-	for _, kv := range keyValues {
-		fmt.Fprintf(w, "%s %s %d %d\r\n", VALUE, kv.key, kv.flag, len(kv.value))
-		w.Write(kv.value)
+	for _, p := range pairs {
+		fmt.Fprintf(w, "%s %s %d %d\r\n", respValue, p.key, p.flag, len(p.value))
+		w.Write(p.value)
 		w.WriteString("\r\n")
-		if strings.EqualFold(cmd, GET_NAME) {
-			q.AckMessage(kv.queue, kv.group, kv.id)
+		if cmd == cmdGet {
+			q.AckMessage(p.queue, p.group, p.id)
 		}
 	}
-	w.WriteString(END)
-	return nil
+	w.WriteString(respEnd)
+	return false
 }

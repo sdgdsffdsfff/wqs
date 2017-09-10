@@ -18,6 +18,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -30,7 +31,9 @@ import (
 )
 
 var (
-	configFile = flag.String("config", "config.properties", "qservice's configure file")
+	configFile  = flag.String("config", "config.properties", "qservice's configure file")
+	flagVersion = flag.Bool("version", false, "Show version information")
+	version     = "unknown"
 )
 
 func initLogger(conf *config.Config) error {
@@ -73,6 +76,14 @@ func main() {
 
 	flag.Parse()
 
+	if *flagVersion {
+		fmt.Printf("version : %s\n", version)
+		return
+	}
+
+	waitExist := make(chan os.Signal, 1)
+	signal.Notify(waitExist, syscall.SIGTERM, os.Interrupt, os.Kill, syscall.SIGSTOP)
+
 	conf, err := config.NewConfigFromFile(*configFile)
 	if err != nil {
 		log.Fatal(errors.ErrorStack(err))
@@ -82,25 +93,24 @@ func main() {
 		log.Fatal(errors.ErrorStack(err))
 	}
 
-	server, err := service.NewServer(conf)
-	if err != nil {
-		log.Fatal(errors.ErrorStack(err))
-	}
-
-	err = metrics.Init(conf)
-	if err != nil {
+	// 由于下面的service Start时，加载之前持久化的统计数据，因此要在它之前初始化好metrics模块
+	if err := metrics.Start(conf); err != nil {
 		log.Fatalf("init metrics err: %v", err)
 	}
 
-	err = server.Start()
+	server, err := service.NewServer(conf, version)
 	if err != nil {
 		log.Fatal(errors.ErrorStack(err))
 	}
 
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, syscall.SIGTERM, os.Interrupt, os.Kill)
-	log.Debug("Process start")
-	<-c
+	if err = server.Start(); err != nil {
+		log.Fatal(errors.ErrorStack(err))
+	}
+
+	log.Info("<======= process start =======>")
+	log.Infof("<======= receive signal %s to exist... =======>", <-waitExist)
+
 	server.Stop()
-	log.Debug("Process stop")
+	metrics.Stop()
+	log.Info("<======= process stop =======>")
 }

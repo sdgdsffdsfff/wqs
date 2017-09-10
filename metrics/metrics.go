@@ -17,11 +17,9 @@ limitations under the License.
 package metrics
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"os"
-	"sync"
+	"errors"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/weibocom/wqs/config"
@@ -30,212 +28,349 @@ import (
 	"github.com/rcrowley/go-metrics"
 )
 
-const (
-	INCR = iota
-	INCR_EX
-	INCR_EX2
-	DECR
+var (
+	errInvalidParam     = errors.New("Invalid params")
+	errInvalidReader    = errors.New("Invalid reader")
+	errUnknownTransport = errors.New("Unknown transport")
 )
 
-var opMap = map[uint8]string{
-	INCR:     "incr",
-	INCR_EX:  "incr_ex",
-	INCR_EX2: "incr_ex2",
-	DECR:     "decr",
-}
+type eventType int32
 
 const (
-	defaultChSize    = 1024 * 10
-	defaultPrintTTL  = 30
-	defaultReportURI = "http://127.0.0.1:10001/v1/metrics"
+	eventCounter eventType = iota
+	eventMeter
+	eventTimer
+	eventGauge
 )
 
 const (
-	WQS     = "WQS"
-	QPS     = "qps"
-	ELAPSED = "elapsed"
-	LATENCY = "ltc"
-	SENT    = "sent"
-	RECV    = "recv"
+	ElapseLess10ms  = "Less10ms"
+	ElapseLess20ms  = "Less20ms"
+	ElapseLess50ms  = "Less50ms"
+	ElapseLess100ms = "Less100ms"
+	ElapseLess200ms = "Less200ms"
+	ElapseLess500ms = "Less500ms"
+	ElapseMore500ms = "More500ms"
+
+	CmdGet      = "GET"
+	CmdGetMiss  = "GETMiss"
+	CmdGetError = "GetError"
+	CmdSet      = "SET"
+	CmdSetError = "SetError"
+	CmdAck      = "ACK"
+	CmdAckError = "AckError"
+	Qps         = "qps"
+	Ops         = "ops"
+	Accum       = "Accum"
+	Latency     = "Latency"
+	ToConn      = "ToConn"
+	ReConn      = "ReConn"
+	Elapsed     = "elapsed"
+	Rebalance   = "Rebalance"
+	RecvError   = "RecvError"
+	BytesRead   = "BytesRead"
+	BytesWriten = "BytesWriten"
+	Goroutine   = "Goroutine"
+	Gc          = "Gc"
+	GcPauseAvg  = "GcPauseAvg"
+	GcPauseMax  = "GcPauseMax"
+	GcPauseMin  = "GcPauseMin"
+	MemAlloc    = "MemAlloc"
+
+	AllHost = "*"
+
+	eventBufferSize = 1024 * 100
+	defaultWriter   = graphiteWriter
+	defaultReader   = graphiteWriter
+	localhost       = "localhost"
+	sinkDuration    = time.Second * 5
 )
 
-type Packet struct {
-	Op      uint8
-	Key     string
-	Val     int64
-	Elapsed int64
-	Latency int64
+type event struct {
+	event eventType
+	key   string
+	value int64
 }
 
-func (p *Packet) String() string {
-	bf := &bytes.Buffer{}
-	bf.WriteString("packet: ")
-	if _, ok := opMap[p.Op]; !ok {
-		bf.WriteString("unknown")
-	} else {
-		bf.WriteString(opMap[p.Op])
-	}
-	bf.WriteString("/" + p.Key)
-	bf.WriteString("/" + fmt.Sprint(p.Val))
-	bf.WriteString("/" + fmt.Sprint(p.Elapsed))
-	bf.WriteString("/" + fmt.Sprint(p.Latency))
-	return bf.String()
+type registry struct {
+	eventBus chan *event
+	registry metrics.Registry
+	writers  map[string]statWriter
+	reader   statReader
+	stopCh   chan struct{}
+	stopping int32
 }
 
-type MetricsClient struct {
-	in       chan *Packet
-	r        metrics.Registry
-	d        metrics.Registry
-	printTTL time.Duration
-
-	centerAddr  string
-	serviceName string
-	endpoint    string
-	wg          *sync.WaitGroup
-	stop        chan struct{}
-
-	transport Transport
+var reg = &registry{
+	registry: metrics.NewRegistry(),
+	eventBus: make(chan *event, eventBufferSize),
+	stopCh:   make(chan struct{}),
+	stopping: 0,
+	writers:  make(map[string]statWriter),
 }
 
-var defaultClient *MetricsClient
+func Start(cfg *config.Config) (err error) {
 
-func Init(cfg *config.Config) (err error) {
-	hn, err := os.Hostname()
-	if err != nil {
-		hn = "unknown"
-	}
-	defaultClient = &MetricsClient{
-		r:           metrics.NewRegistry(),
-		d:           metrics.NewRegistry(),
-		in:          make(chan *Packet, defaultChSize),
-		serviceName: "wqs",
-		endpoint:    hn,
-		stop:        make(chan struct{}),
-		transport:   newRoamClient("127.0.0.1"),
-	}
-
-	sec, err := cfg.GetSection("metrics")
+	section, err := cfg.GetSection("metrics")
 	if err != nil {
 		return err
 	}
-	uri := sec.GetStringMust("metrics.center", defaultReportURI)
-	uri = uri + "/" + defaultClient.serviceName
-	defaultClient.centerAddr = uri
 
-	ttl := sec.GetInt64Must("metrics.print_ttl", defaultPrintTTL)
-	defaultClient.printTTL = time.Second * time.Duration(ttl)
+	// 初始化states的reader和writer
+	writers := section.GetStringMust("transport.writers", defaultWriter)
+	names := strings.Split(writers, ",")
+	for _, name := range names {
+		w, err := getWriter(name, section)
+		if err != nil {
+			return err
+		}
+		reg.writers[name] = w
+	}
 
-	go defaultClient.run()
-	return
+	reader := section.GetStringMust("transport.reader", defaultReader)
+	reg.reader, err = getReader(reader, section)
+	if err != nil {
+		return err
+	}
+
+	go reg.eventLoop()
+	return nil
 }
 
-func (m *MetricsClient) run() {
-	tk := time.NewTicker(m.printTTL)
-	defer tk.Stop()
+func Stop() {
+	reg.stop()
+}
 
-	reportTk := time.NewTicker(time.Second * 1)
-	defer reportTk.Stop()
-	var p *Packet
+func (r *registry) stop() {
+	if atomic.SwapInt32(&r.stopping, 1) == 0 {
+		close(r.stopCh)
+	}
+}
+
+func (r *registry) eventLoop() {
+
+	if atomic.LoadInt32(&r.stopping) == 1 {
+		return
+	}
+
+	ticker := time.NewTicker(sinkDuration)
+
 	for {
 		select {
-		case p = <-m.in:
-			m.do(p)
-		case <-tk.C:
-			m.print()
-		case <-reportTk.C:
-			m.report()
-		case <-m.stop:
+		case evt := <-r.eventBus:
+			r.processEvent(evt)
+		case <-ticker.C:
+			r.sink()
+		case <-r.stopCh:
+			ticker.Stop()
 			return
 		}
 	}
 }
 
-func (m *MetricsClient) do(p *Packet) {
-	switch p.Op {
-	case INCR:
-		m.incr(p.Key, p.Val)
-	case INCR_EX:
-		m.incrEx(p.Key, p.Val, p.Elapsed)
-	case INCR_EX2:
-		m.incrEx2(p.Key, p.Val, p.Elapsed, p.Latency)
-	case DECR:
-		m.decr(p.Key, p.Val)
+func (r *registry) processEvent(evt *event) {
+	switch evt.event {
+	case eventCounter:
+		metrics.GetOrRegisterCounter(evt.key, r.registry).Inc(evt.value)
+	case eventMeter:
+		getOrRegisterMeter(evt.key, r.registry).Mark(evt.value)
+	case eventTimer:
+		getOrRegisterTimer(evt.key, r.registry).Update(time.Duration(evt.value))
+	case eventGauge:
+		metrics.GetOrRegisterGauge(evt.key, r.registry).Update(evt.value)
 	}
 }
 
-func (m *MetricsClient) print() {
-	var bf = &bytes.Buffer{}
-	shot := map[string]interface{}{
-		"endpoint": m.endpoint,
-		"service":  m.serviceName,
-		"data":     m.r,
-	}
-	json.NewEncoder(bf).Encode(shot)
-	log.Info("[metrics] " + bf.String())
-}
+func (r *registry) snapshot() metrics.Registry {
+	hasElement := false
+	snap := metrics.NewRegistry()
 
-func (m *MetricsClient) report() {
-	var bf = &bytes.Buffer{}
-	shot := map[string]interface{}{
-		"endpoint": m.endpoint,
-		"service":  m.serviceName,
-		"data":     m.d,
-	}
-	json.NewEncoder(bf).Encode(shot)
-	log.Info("[metrics] QPS " + bf.String())
-
-	results := snapShotMetricsSts(m.d)
-	m.d.Each(func(k string, _ interface{}) {
-		c := metrics.GetOrRegisterCounter(k, m.d)
-		c.Clear()
+	r.registry.Each(func(key string, i interface{}) {
+		switch m := i.(type) {
+		case metrics.Counter:
+			snap.Register(key, m.Snapshot())
+		case metrics.Gauge:
+			snap.Register(key, m.Snapshot())
+		case metrics.GaugeFloat64:
+			snap.Register(key, m.Snapshot())
+		case metrics.Histogram:
+			snap.Register(key, m.Snapshot())
+		case metrics.Meter:
+			snap.Register(key, m.Snapshot())
+		case metrics.Timer:
+			snap.Register(key, m.Snapshot())
+		}
+		hasElement = true
 	})
-
-	// TODO
-	// http should be async
-	// file should be async-write, log should be refact
-	bf.Reset()
-	json.NewEncoder(bf).Encode(results)
-	m.transport.Send(m.centerAddr, bf.Bytes())
+	if !hasElement {
+		return nil
+	}
+	return snap
 }
 
-func (m *MetricsClient) incr(k string, v int64) {
-	d := metrics.GetOrRegisterCounter(k, m.d)
-	d.Inc(v)
-}
+func (r *registry) sink() {
 
-func (m *MetricsClient) incrEx(k string, v, elapsed int64) {
-	d := metrics.GetOrRegisterCounter(k+"#"+QPS, m.d)
-	d.Inc(v)
-	d = metrics.GetOrRegisterCounter(k+"#"+ELAPSED, m.d)
-	d.Inc(elapsed)
-}
-
-func (m *MetricsClient) incrEx2(k string, v, elapsed, latency int64) {
-	d := metrics.GetOrRegisterCounter(k+"#"+QPS, m.d)
-	d.Inc(v)
-	d = metrics.GetOrRegisterCounter(k+"#"+ELAPSED, m.d)
-	d.Inc(elapsed)
-	d = metrics.GetOrRegisterCounter(k+"#"+LATENCY, m.d)
-	d.Inc(latency)
-}
-
-func (m *MetricsClient) decr(k string, v int64) {
-	// TODO
-}
-
-func Add(key string, args ...int64) {
-	var pkt *Packet
-	if len(args) == 1 {
-		pkt = &Packet{INCR, key, args[0], 0, 0}
-	} else if len(args) == 2 {
-		pkt = &Packet{INCR_EX, key, args[0], args[1], 0}
-	} else if len(args) == 3 {
-		pkt = &Packet{INCR_EX2, key, args[0], args[1], args[2]}
+	snap := r.snapshot()
+	if snap == nil {
+		log.Warn("metrics snapshot empty.")
+		return
 	}
 
+	for name, writer := range r.writers {
+		if err := writer.Write(snap); err != nil {
+			log.Errorf("metrics writer %s error : %v", name, err)
+		}
+	}
+}
+
+func AddCounter(key string, value int64) {
+	evt := &event{event: eventCounter, key: key, value: value}
 	select {
-	case defaultClient.in <- pkt:
+	case reg.eventBus <- evt:
 	default:
-		log.Warnf("metrics chan is full: %s", pkt)
+		log.Error("metrics eventBus is full.")
 	}
+}
+
+func GetCounter(key string) int64 {
+	return metrics.GetOrRegisterCounter(key, reg.registry).Count()
+}
+
+func AddMeter(key string, value int64) {
+	evt := &event{event: eventMeter, key: key, value: value}
+	select {
+	case reg.eventBus <- evt:
+	default:
+		log.Error("metrics eventBus is full.")
+	}
+}
+
+func GetMeterRate(key string) float64 {
+	return getOrRegisterMeter(key, reg.registry).Rate1()
+}
+
+func AddTimer(key string, duration int64) {
+	evt := &event{event: eventTimer, key: key, value: duration}
+	select {
+	case reg.eventBus <- evt:
+	default:
+		log.Error("metrics eventBus is full.")
+	}
+}
+
+func GetTimerMean(key string) float64 {
+	return getOrRegisterTimer(key, reg.registry).RateMean()
+}
+
+func AddGauge(key string, value int64) {
+	select {
+	case reg.eventBus <- &event{event: eventGauge, key: key, value: value}:
+	default:
+		log.Error("metrics eventBus is full.")
+	}
+}
+
+func GetMetrics(param *QueryParam) (stat string, err error) {
+
+	if reg.reader == nil {
+		return "", errInvalidReader
+	}
+
+	if err := param.validate(); err != nil {
+		return "", err
+	}
+
+	return reg.reader.Read(param)
+}
+
+func ElapseTimeString(t int64) string {
+	switch {
+	case t < 10:
+		return ElapseLess10ms
+	case t < 20:
+		return ElapseLess20ms
+	case t < 50:
+		return ElapseLess50ms
+	case t < 100:
+		return ElapseLess100ms
+	case t < 200:
+		return ElapseLess200ms
+	case t < 500:
+		return ElapseLess500ms
+	default:
+		return ElapseMore500ms
+	}
+}
+
+func getWriter(name string, section config.Section) (statWriter, error) {
+	switch name {
+	case graphiteWriter:
+		graphiteAddr, err := section.GetString("graphite.report.addr.udp")
+		if err != nil {
+			return nil, err
+		}
+		graphiteServicePool, err := section.GetString("graphite.service.pool")
+		if err != nil {
+			return nil, err
+		}
+		graphiteRoot := section.GetStringMust("graphite.root", localhost)
+		return newGraphite(graphiteRoot, graphiteAddr, graphiteServicePool), nil
+	case profileWriter:
+		return newProfileWriter(), nil
+	default:
+		log.Errorf("unknown metrics writer: %s", name)
+	}
+	return nil, errUnknownTransport
+}
+
+func getReader(name string, section config.Section) (statReader, error) {
+	switch name {
+	case graphiteWriter:
+		graphiteAddr, err := section.GetString("graphite.report.addr.udp")
+		if err != nil {
+			return nil, err
+		}
+		graphiteServicePool, err := section.GetString("graphite.service.pool")
+		if err != nil {
+			return nil, err
+		}
+		graphiteRoot := section.GetStringMust("graphite.root", localhost)
+		return newGraphite(graphiteRoot, graphiteAddr, graphiteServicePool), nil
+	default:
+		log.Errorf("unknown metrics writer: %s", name)
+	}
+	return nil, errUnknownTransport
+}
+
+type QueryParam struct {
+	Host       string
+	Group      string
+	Queue      string
+	ActionKey  string
+	MetricsKey string
+	StartTime  int64
+	EndTime    int64
+	Step       int64
+}
+
+func (q *QueryParam) validate() error {
+	switch {
+	case q.StartTime == 0:
+		fallthrough
+	case q.EndTime == 0:
+		fallthrough
+	case q.Step == 0:
+		fallthrough
+	case q.Host == "":
+		fallthrough
+	case q.Queue == "":
+		fallthrough
+	case q.Group == "":
+		fallthrough
+	case q.ActionKey == "":
+		fallthrough
+	case q.MetricsKey == "":
+		return errInvalidParam
+	}
+	return nil
 }

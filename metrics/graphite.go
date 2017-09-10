@@ -13,148 +13,201 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package metrics
 
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"net"
 	"net/http"
+	"strings"
 
 	"github.com/weibocom/wqs/log"
+
+	"github.com/rcrowley/go-metrics"
 )
 
 const (
-	_OVERVIEW_URI_TPL = "http://%s/render?from=%d&until=%d&target=%s&format=json"
-	_GROUP_URI_TPL    = "http://%s/render?from=%d&until=%d&target=%s&group=%s&queue=%s&action=%s&format=json"
+	messageMaxLen  = 65000
+	graphiteWriter = "graphite"
 )
 
-type RoamStruct struct {
-	Type    string  `json:"type"`
-	Queue   string  `json:"queue"`
-	Group   string  `json:"group"`
-	Action  string  `json:"action"`
-	Total   int64   `json:"total_count"`
-	AvgTime float64 `json:"avg_time"`
+type graphite struct {
+	root        string
+	addr        string
+	servicePool string
 }
 
-type RoamClient struct {
-	root string
-	cli  *http.Client
-}
-
-func newRoamClient(root string) *RoamClient {
-	return &RoamClient{
-		cli: &http.Client{},
+func newGraphite(root, addr, servicePool string) *graphite {
+	return &graphite{
+		root:        root,
+		addr:        addr,
+		servicePool: servicePool,
 	}
 }
 
-func (m *RoamClient) Send(key string, data []byte) (err error) {
-	if len(data) == 0 || string(data) == "[]" {
-		return
-	}
-	sts, err := transToRoamStruct(data)
+func (g *graphite) Write(snap metrics.Registry) error {
+
+	conn, err := net.Dial("udp", g.addr)
 	if err != nil {
-		log.Warnf("store profile log err : %v", err)
 		return err
 	}
-	for i := range sts {
-		log.Profile("%s", sts[i])
+
+	ip := strings.SplitN(conn.LocalAddr().String(), ":", 2)[0]
+	ip = strings.Replace(ip, ".", "_", -1)
+	messages := genGraphiteMessages(ip, g.servicePool, snap)
+
+	for _, message := range messages {
+		_, err = conn.Write([]byte(message))
+		if err != nil {
+			log.Errorf("graphite send message error: %v", err)
+		}
 	}
-	return
+
+	return conn.Close()
 }
 
-func (m *RoamClient) Overview(start, end, step int64, host string) (ret string, err error) {
-	reqURL := fmt.Sprintf(_OVERVIEW_URI_TPL, m.root, start, end, host)
-	res, err := m.doRequest(reqURL)
-	_ = res
-	return
+func (m *graphite) genGraphiteRequestURL(startTime int64, endTime int64, target string) string {
+	return fmt.Sprintf("http://%s/render?from=%d&until=%d&target=%s&format=json",
+		m.root, startTime, endTime, target)
 }
 
-func (m *RoamClient) GroupMetrics(start, end, step int64, group, queue string) (ret string, err error) {
-	reqURL := fmt.Sprintf(_GROUP_URI_TPL, m.root, start, end, "*", group, queue, "*")
-	res, err := m.doRequest(reqURL)
-	_ = res
-	return
+func (m *graphite) genTarget(param *QueryParam) string {
+	return fmt.Sprintf("stats_byhost.openapi_profile.%s.byhost.%s.%s.%s.%s.%s",
+		m.servicePool, param.Host, param.Queue, param.Group, param.ActionKey, param.MetricsKey)
 }
 
-func (m *RoamClient) doRequest(reqURL string) (ret string, err error) {
-	req, err := http.NewRequest("GET", reqURL, nil)
+func (m *graphite) Read(param *QueryParam) (data string, err error) {
+	target := m.genTarget(param)
+	url := m.genGraphiteRequestURL(param.StartTime, param.EndTime, target)
+	dataset, err := m.doRequest(url)
 	if err != nil {
 		return "", err
 	}
-	resp, err := m.cli.Do(req)
+
+	if param.Host == AllHost {
+		return mergeDataSet(dataset).String(), nil
+	}
+	return dataset.String(), nil
+}
+
+func (m *graphite) doRequest(url string) (metricsDatas dataSets, err error) {
+
+	resp, err := http.Get(url)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("graphite request %d error", resp.StatusCode)
 	}
-	res, err := parseGraphiteResponse(data)
-	if err != nil {
-		return "", err
-	}
-	_ = res
-	return
-}
 
-func transToRoamStruct(data []byte) (jsonStrs []string, err error) {
-	var results []*MetricsStat
-	err = json.Unmarshal(data, &results)
+	var graphiteResponse []*graphiteDataSet
+	err = json.NewDecoder(resp.Body).Decode(&graphiteResponse)
 	if err != nil {
 		return nil, err
 	}
 
-	action := func(st *MetricsStat) []*RoamStruct {
-		ret := make([]*RoamStruct, 0, 2)
-		actions := []string{SENT, RECV}
-		for _, act := range actions {
-			rst := &RoamStruct{
-				Type:   WQS,
-				Queue:  st.Queue,
-				Group:  st.Group,
-				Action: act,
-			}
-			switch act {
-			case SENT:
-				rst.Total = st.Sent.Total
-				rst.AvgTime = st.Sent.Elapsed
-			case RECV:
-				rst.Total = st.Recv.Total
-				rst.AvgTime = st.Recv.Elapsed
-			}
-			ret = append(ret, rst)
+	for _, dataset := range graphiteResponse {
+		data := new(metricsData)
+		for _, point := range dataset.DataPoints {
+			data.Points = append(data.Points, metricsDataPoint{
+				TimeStamp: point.GetTimestamp(),
+				Value:     point.GetValue(),
+			})
 		}
-		return ret
+		metricsDatas = append(metricsDatas, data)
 	}
 
-	for _, st := range results {
-		rsts := action(st)
-		for _, rst := range rsts {
-			stData, err := json.Marshal(rst)
-			if err != nil {
-				log.Warnf("transToRoamStruct err : %v", err)
-				continue
-			}
-			jsonStrs = append(jsonStrs, string(stData))
+	return metricsDatas, nil
+}
+
+func genGraphiteMessages(localIP string, servicePool string, snap metrics.Registry) []string {
+	messages := make([]string, 0)
+	segments := make([]string, 0)
+	segmentsLength := 0
+
+	snap.Each(func(key string, i interface{}) {
+		var segment string
+		switch m := i.(type) {
+		case metrics.Counter:
+			segment = fmt.Sprintf("openapi_profile.%s.byhost.%s.%s:%d|c",
+				servicePool, localIP, key, m.Count())
+		case metrics.Meter:
+			segment = fmt.Sprintf("openapi_profile.%s.byhost.%s.%s:%.2f|c",
+				servicePool, localIP, key, m.Rate1())
+		case metrics.Timer:
+			segment = fmt.Sprintf("openapi_profile.%s.byhost.%s.%s:%.2f|ms",
+				servicePool, localIP, key, m.RateMean())
+		case metrics.Gauge:
+			segment = fmt.Sprintf("openapi_profile.%s.byhost.%s.%s:%d|kv",
+				servicePool, localIP, key, m.Value())
+		//	case metrics.GaugeFloat64:
+		//	case metrics.Histogram:
+		default:
+			return
+		}
+		if segmentsLength+len(segment) > messageMaxLen {
+			message := strings.Join(segments, "\n") + "\n"
+			messages = append(messages, message)
+			segments = make([]string, 0)
+			segmentsLength = 0
+		}
+		segments = append(segments, segment)
+		segmentsLength += len(segment)
+	})
+
+	message := strings.Join(segments, "\n") + "\n"
+	messages = append(messages, message)
+
+	return messages
+}
+
+type dataPoint [2]interface{}
+
+func (c dataPoint) GetValue() float64 {
+	switch c[0].(type) {
+	case int64:
+		return float64(c[0].(int64))
+	case float64:
+		return c[0].(float64)
+	default:
+		return 0.0
+	}
+}
+
+func (c dataPoint) GetTimestamp() int64 {
+	switch c[1].(type) {
+	case int64:
+		return c[1].(int64)
+	case float64:
+		return int64(c[1].(float64))
+	default:
+		return 0
+	}
+}
+
+type graphiteDataSet struct {
+	Target     string      `json:"target"`
+	DataPoints []dataPoint `json:"datapoints"`
+}
+
+func mergeDataSet(datasets dataSets) *metricsData {
+	if datasets == nil || len(datasets) == 0 {
+		return &metricsData{Points: make([]metricsDataPoint, 0)}
+	}
+
+	data := &metricsData{Points: make([]metricsDataPoint, len(datasets[0].Points))}
+	for _, dataset := range datasets {
+		if len(dataset.Points) != len(data.Points) {
+			continue
+		}
+		for i, point := range dataset.Points {
+			data.Points[i].TimeStamp = point.TimeStamp
+			data.Points[i].Value += point.Value
 		}
 	}
-	return
-}
-
-type Cell [2]interface{}
-
-type GraphiteSer struct {
-	Target string `json:"target"`
-	Data   []Cell `json:"datapoints"`
-}
-
-type GraphiteResponse []*GraphiteSer
-
-func parseGraphiteResponse(data []byte) (resp GraphiteResponse, err error) {
-	err = json.Unmarshal(data, &resp)
-	return
+	return data
 }

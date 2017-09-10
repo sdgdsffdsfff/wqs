@@ -64,6 +64,12 @@ func RestLogger(logger *Logger, levels ...uint32) {
 	opsRWLock.Unlock()
 }
 
+func ProfileGetLogger() *Logger {
+	profRWLock.RLock()
+	defer profRWLock.RUnlock()
+	return profLogger
+}
+
 func GetLogger(level uint32) *Logger {
 	opsRWLock.RLock()
 	defer opsRWLock.RUnlock()
@@ -79,7 +85,7 @@ func Fatal(args ...interface{}) {
 
 func Fatalf(format string, args ...interface{}) {
 	opsRWLock.RLock()
-	opsLogger[LogFatal].logf(LogFatal, format, args...)
+	opsLogger[LogFatal].logformat(LogFatal, format, args...)
 	opsRWLock.RUnlock()
 	os.Exit(-1)
 }
@@ -92,7 +98,7 @@ func Error(args ...interface{}) {
 
 func Errorf(format string, args ...interface{}) {
 	opsRWLock.RLock()
-	opsLogger[LogError].logf(LogError, format, args...)
+	opsLogger[LogError].logformat(LogError, format, args...)
 	opsRWLock.RUnlock()
 }
 
@@ -104,7 +110,7 @@ func Debug(args ...interface{}) {
 
 func Debugf(format string, args ...interface{}) {
 	opsRWLock.RLock()
-	opsLogger[LogDebug].logf(LogDebug, format, args...)
+	opsLogger[LogDebug].logformat(LogDebug, format, args...)
 	opsRWLock.RUnlock()
 }
 
@@ -116,7 +122,7 @@ func Warn(args ...interface{}) {
 
 func Warnf(format string, args ...interface{}) {
 	opsRWLock.RLock()
-	opsLogger[LogWarning].logf(LogWarning, format, args...)
+	opsLogger[LogWarning].logformat(LogWarning, format, args...)
 	opsRWLock.RUnlock()
 }
 
@@ -128,6 +134,6 @@ func Info(args ...interface{}) {
 
 func Infof(format string, args ...interface{}) {
 	opsRWLock.RLock()
-	opsLogger[LogInfo].logf(LogInfo, format, args...)
+	opsLogger[LogInfo].logformat(LogInfo, format, args...)
 	opsRWLock.RUnlock()
 }

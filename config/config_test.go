@@ -17,12 +17,18 @@ limitations under the License.
 package config
 
 import (
-	"fmt"
-	"reflect"
 	"testing"
 )
 
-func TestConfig(t *testing.T) {
+func TestConfigFromFile(t *testing.T) {
+	config, err := NewConfigFromFile("../config.properties")
+	if err != nil {
+		t.Fatalf("NewConfigFromFile err : %v", err)
+	}
+	t.Logf("config:\n%s\n", config.String())
+}
+
+func TestGetSection(t *testing.T) {
 	config, err := NewConfigFromFile("../config.properties")
 	if err != nil {
 		t.Fatalf("NewConfigFromFile err : %s", err)
@@ -30,14 +36,22 @@ func TestConfig(t *testing.T) {
 	if config == nil {
 		t.Fatalf("get nil config")
 	}
-
-	v := reflect.ValueOf(config).Elem()
-	if v.Kind() != reflect.Struct {
-		t.Fatalf("get config with invaild type")
+	sec, err := config.GetSection("metrics")
+	if err != nil || sec == nil {
+		t.FailNow()
 	}
+}
 
-	for i := 0; i < v.NumField(); i++ {
-		fmt.Printf("%s: %v\n", v.Type().Field(i).Name, v.Field(i).Interface())
+func TestGetSections(t *testing.T) {
+	config, err := NewConfigFromFile("../config.properties")
+	if err != nil {
+		t.Fatalf("NewConfigFromFile err : %s", err)
 	}
-
+	if config == nil {
+		t.Fatalf("config is nil, want is not nil")
+	}
+	sections := config.GetSections()
+	if len(sections) != len(config.sections) {
+		t.Fatalf("len(sections) != len(config.sections)")
+	}
 }

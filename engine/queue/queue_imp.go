@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,90 +36,85 @@ import (
 	"github.com/juju/errors"
 )
 
-type kafkaLogger struct {
-}
-
-func (l *kafkaLogger) Print(v ...interface{}) {
-	args := []interface{}{"[sarama] "}
-	args = append(args, v...)
-	log.Info(args...)
-}
-
-func (l *kafkaLogger) Printf(format string, v ...interface{}) {
-	log.Info("[sarama] ", fmt.Sprintf(format, v...))
-}
-
-func (l *kafkaLogger) Println(v ...interface{}) {
-	args := []interface{}{"[sarama] "}
-	args = append(args, v...)
-	log.Info(args...)
-}
-
-func init() {
-	sarama.Logger = &kafkaLogger{}
-}
-
 type queueImp struct {
 	conf          *config.Config
 	clusterConfig *cluster.Config
 	metadata      *Metadata
 	producer      *kafka.Producer
-	monitor       *metrics.Monitor
 	idGenerator   *idGenerator
 	consumerMap   map[string]*kafka.Consumer
+	dying         chan struct{}
 	vaildName     *regexp.Regexp
-	mu            sync.Mutex
+	rw            sync.RWMutex
+	uptime        time.Time
+	version       string
+	numGc         uint32
+	gcPause       uint64
 }
 
-func newQueue(config *config.Config) (*queueImp, error) {
+const clockTime = 30 * time.Second
+
+// return a custom cluster config
+func genClusterConfig(hostname string) *cluster.Config {
+
+	config := cluster.NewConfig()
+	// Network
+	config.Config.Net.KeepAlive = 30 * time.Second
+	config.Config.Net.MaxOpenRequests = 20
+	config.Config.Net.DialTimeout = 10 * time.Second
+	config.Config.Net.ReadTimeout = 10 * time.Second
+	config.Config.Net.WriteTimeout = 10 * time.Second
+	// Metadata
+	config.Config.Metadata.Retry.Backoff = 100 * time.Millisecond
+	config.Config.Metadata.Retry.Max = 5
+	config.Config.Metadata.RefreshFrequency = 1 * time.Minute
+	// Producer
+	config.Config.Producer.RequiredAcks = sarama.WaitForLocal
+	//conf.Producer.RequiredAcks = sarama.NoResponse //this one high performance than WaitForLocal
+	config.Config.Producer.Partitioner = sarama.NewRandomPartitioner
+	config.Config.Producer.Flush.Frequency = time.Millisecond
+	config.Config.Producer.Flush.MaxMessages = 200
+	config.Config.ChannelBufferSize = 1024
+	// Common
+	config.Config.ClientID = fmt.Sprintf("%d..%s", os.Getpid(), hostname)
+	config.Group.Heartbeat.Interval = 50 * time.Millisecond
+	// Consumer
+	config.Config.Consumer.Retry.Backoff = 500 * time.Millisecond
+	config.Config.Consumer.Offsets.CommitInterval = 100 * time.Millisecond
+	config.Config.Consumer.Offsets.Initial = sarama.OffsetOldest
+	config.Config.Consumer.Offsets.Retention = 7 * 24 * time.Hour
+	config.Config.Consumer.Return.Errors = true
+	config.Group.Offsets.Retry.Max = 3
+	config.Group.Return.Notifications = true
+	config.Group.Session.Timeout = 10 * time.Second
+	return config
+}
+
+// return a new queue instance
+func newQueue(config *config.Config, version string) (*queueImp, error) {
 
 	hostname, err := os.Hostname()
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	clusterConfig := cluster.NewConfig()
-	// Network
-	clusterConfig.Config.Net.KeepAlive = 30 * time.Second
-	clusterConfig.Config.Net.MaxOpenRequests = 20
-	clusterConfig.Config.Net.DialTimeout = 10 * time.Second
-	clusterConfig.Config.Net.ReadTimeout = 10 * time.Second
-	clusterConfig.Config.Net.WriteTimeout = 10 * time.Second
-	// Metadata
-	clusterConfig.Config.Metadata.Retry.Backoff = 100 * time.Millisecond
-	clusterConfig.Config.Metadata.Retry.Max = 5
-	clusterConfig.Config.Metadata.RefreshFrequency = 1 * time.Minute
-	// Producer
-	clusterConfig.Config.Producer.RequiredAcks = sarama.WaitForLocal
-	//conf.Producer.RequiredAcks = sarama.NoResponse //this one high performance than WaitForLocal
-	clusterConfig.Config.Producer.Partitioner = sarama.NewRandomPartitioner
-	clusterConfig.Config.Producer.Flush.Frequency = time.Millisecond
-	clusterConfig.Config.Producer.Flush.MaxMessages = 200
-	clusterConfig.Config.ChannelBufferSize = 1024
-	// Common
-	clusterConfig.Config.ClientID = fmt.Sprintf("%d..%s", os.Getpid(), hostname)
-	clusterConfig.Group.Heartbeat.Interval = 50 * time.Millisecond
-	// Consumer
-	clusterConfig.Config.Consumer.Retry.Backoff = 500 * time.Millisecond
-	clusterConfig.Config.Consumer.Offsets.CommitInterval = 100 * time.Millisecond
-	//clusterConfig.Config.Consumer.Offsets.Initial = sarama.OffsetOldest
-	clusterConfig.Group.Offsets.Retry.Max = 3
-	clusterConfig.Group.Session.Timeout = 10 * time.Second
 
+	clusterConfig := genClusterConfig(hostname)
 	metadata, err := NewMetadata(config, &clusterConfig.Config)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
-	srvInfo := &ServiceInfo{
+	info := &proxyInfo{
 		Host:   hostname,
-		Config: config,
+		config: config,
 	}
-	err = metadata.RegisterService(config.ProxyId, srvInfo.String())
-	if err != nil {
+
+	if err = metadata.RegisterService(config.ProxyId, info.String()); err != nil {
 		metadata.Close()
 		return nil, errors.Trace(err)
 	}
-	producer, err := kafka.NewProducer(metadata.manager.BrokerAddrs(), &clusterConfig.Config)
+
+	producer, err := kafka.NewProducer(metadata.LocalManager().BrokerAddrs(), &clusterConfig.Config)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -128,23 +124,31 @@ func newQueue(config *config.Config) (*queueImp, error) {
 		clusterConfig: clusterConfig,
 		metadata:      metadata,
 		producer:      producer,
-		monitor:       metrics.NewMonitor(config.RedisAddr),
 		idGenerator:   newIDGenerator(uint64(config.ProxyId)),
-		vaildName:     regexp.MustCompile(`^[a-zA-Z0-9]{1,20}$`),
+		vaildName:     regexp.MustCompile(`^[a-zA-Z0-9_]{1,20}$`),
 		consumerMap:   make(map[string]*kafka.Consumer),
+		dying:         make(chan struct{}),
+		uptime:        time.Now(),
+		version:       version,
 	}
+
+	if err := qs.loadMetrics(); err != nil {
+		log.Errorf("queue load metrics error %v", err)
+	}
+	go qs.clocked()
 	return qs, nil
 }
 
 //Create a queue by name.
-func (q *queueImp) Create(queue string) error {
+func (q *queueImp) Create(queue string, idcs []string) error {
 	// 1. check queue name valid
 	if !q.vaildName.MatchString(queue) {
 		return errors.NotValidf("queue : %q", queue)
 	}
 	// 2. add metadata of queue
-	if err := q.metadata.AddQueue(queue); err != nil {
-		return errors.Trace(err)
+	if err := q.metadata.AddQueue(queue, idcs); err != nil {
+		log.Errorf("create queue %q error %s", queue, errors.ErrorStack(err))
+		return err
 	}
 	return nil
 }
@@ -156,10 +160,11 @@ func (q *queueImp) Update(queue string) error {
 		return errors.NotValidf("queue : %q", queue)
 	}
 	//TODO
-	err := q.metadata.RefreshMetadata()
-	if err != nil {
+
+	if err := q.metadata.RefreshMetadata(); err != nil {
 		return errors.Trace(err)
 	}
+
 	if exist := q.metadata.ExistQueue(queue); !exist {
 		return errors.NotFoundf("queue : %q", queue)
 	}
@@ -175,7 +180,8 @@ func (q *queueImp) Delete(queue string) error {
 	}
 	// 2. delete metadata of queue
 	if err := q.metadata.DelQueue(queue); err != nil {
-		return errors.Trace(err)
+		log.Errorf("delete queue %q error %s", queue, errors.ErrorStack(err))
+		return err
 	}
 	return nil
 }
@@ -184,19 +190,19 @@ func (q *queueImp) Delete(queue string) error {
 //When queue name is "" to get all queue' information.
 func (q *queueImp) Lookup(queue string, group string) (queueInfos []*QueueInfo, err error) {
 
-	err = q.metadata.RefreshMetadata()
-	if err != nil {
-		return nil, errors.Trace(err)
+	if err = q.metadata.RefreshMetadata(); err != nil {
+		log.Errorf("Lookup refresh metadata error %s", errors.ErrorStack(err))
+		return nil, err
 	}
 
 	switch {
 	case queue == "":
 		//Get all queue's information
 		queues := q.metadata.GetQueues()
-		queueInfos, err = q.metadata.GetQueueConfig(queues...)
+		queueInfos, err = q.metadata.GetQueueInfo(queues...)
 	case queue != "" && group == "":
 		//Get a queue's all groups information
-		queueInfos, err = q.metadata.GetQueueConfig(queue)
+		queueInfos, err = q.metadata.GetQueueInfo(queue)
 	default:
 		//Get group's information by queue and group's name
 		exist := q.metadata.ExistGroup(queue, group)
@@ -204,7 +210,7 @@ func (q *queueImp) Lookup(queue string, group string) (queueInfos []*QueueInfo, 
 			err = errors.NotFoundf("queue: %q, group : %q")
 			return
 		}
-		queueInfos, err = q.metadata.GetQueueConfig(queue)
+		queueInfos, err = q.metadata.GetQueueInfo(queue)
 		if err != nil || len(queueInfos) != 1 {
 			return
 		}
@@ -215,7 +221,7 @@ func (q *queueImp) Lookup(queue string, group string) (queueInfos []*QueueInfo, 
 				return
 			}
 		}
-		queueInfos[0].Groups = make([]*GroupConfig, 0)
+		queueInfos[0].Groups = make([]GroupConfig, 0)
 	}
 	return
 }
@@ -227,7 +233,11 @@ func (q *queueImp) AddGroup(group string, queue string,
 		return errors.NotValidf("group : %q , queue : %q", group, queue)
 	}
 
-	if err := q.metadata.AddGroupConfig(group, queue, write, read, url, ips); err != nil {
+	if err := q.metadata.AddGroup(group, queue, write, read, url, ips); err != nil {
+		return errors.Trace(err)
+	}
+
+	if err := q.metadata.ResetOffset(queue, group, sarama.OffsetNewest); err != nil {
 		return errors.Trace(err)
 	}
 	return nil
@@ -252,7 +262,7 @@ func (q *queueImp) DeleteGroup(group string, queue string) error {
 		return errors.NotValidf("group : %q , queue : %q", group, queue)
 	}
 
-	if err := q.metadata.DeleteGroupConfig(group, queue); err != nil {
+	if err := q.metadata.DeleteGroup(group, queue); err != nil {
 		return errors.Trace(err)
 	}
 
@@ -316,136 +326,169 @@ func (q *queueImp) GetSingleGroup(group string, queue string) (*GroupConfig, err
 }
 
 func (q *queueImp) SendMessage(queue string, group string, data []byte, flag uint64) (string, error) {
+
 	start := time.Now()
 
-	exist := q.metadata.ExistGroup(queue, group)
-	if !exist {
+	if ok := q.metadata.ExistGroup(queue, group); !ok {
+		metrics.AddCounter(metrics.CmdSetError, 1)
+		metrics.AddMeter(metrics.CmdSetError+"."+metrics.Qps, 1)
+		log.Errorf("SendMessage: queue %q group %q not found", queue, group)
 		return "", errors.NotFoundf("queue : %q , group: %q", queue, group)
 	}
 
-	sequenceID := q.idGenerator.Get()
-	key := fmt.Sprintf("%x:%x", sequenceID, flag)
+	sequence := q.idGenerator.Get()
+	key := fmt.Sprintf("%x:%x", sequence, flag)
 
 	partition, offset, err := q.producer.Send(queue, []byte(key), data)
 	if err != nil {
-		return "", errors.Trace(err)
+		metrics.AddCounter(metrics.CmdSetError, 1)
+		metrics.AddMeter(metrics.CmdSetError+"."+metrics.Qps, 1)
+		log.Errorf("SendMessage: queue %q group %q error %s", queue, group, err)
+		return "", err
 	}
-	messageID := fmt.Sprintf("%x:%s:%s:%x:%x", sequenceID, queue, group, partition, offset)
+
+	msgId := messageId{
+		queue:     queue,
+		group:     group,
+		idc:       q.metadata.local,
+		partition: partition,
+		offset:    offset,
+		sequence:  sequence,
+	}
+	messageID := msgId.String()
 	cost := time.Now().Sub(start).Nanoseconds() / 1e6
 
-	metrics.Add(queue+"#"+group+"#sent", 1, cost)
-
+	prefix := queue + "." + group + "." + metrics.CmdSet + "."
+	metrics.AddCounter(metrics.CmdSet, 1)
+	metrics.AddCounter(prefix+metrics.Ops, 1)
+	metrics.AddCounter(prefix+metrics.ElapseTimeString(cost), 1)
+	metrics.AddMeter(prefix+metrics.Qps, 1)
+	metrics.AddMeter(prefix+metrics.ElapseTimeString(cost)+"."+metrics.Qps, 1)
+	metrics.AddCounter(metrics.BytesWriten, int64(len(data)))
 	log.Debugf("send %s:%s key %s id %s cost %d", queue, group, key, messageID, cost)
 	return messageID, nil
 }
 
 func (q *queueImp) RecvMessage(queue string, group string) (string, []byte, uint64, error) {
-	var err error
+
 	start := time.Now()
-	exist := q.metadata.ExistGroup(queue, group)
-	if !exist {
+
+	if ok := q.metadata.ExistGroup(queue, group); !ok {
+		metrics.AddMeter(metrics.CmdGetError+"."+metrics.Qps, 1)
+		log.Errorf("RecvMessage: queue %q group %q not found", queue, group)
 		return "", nil, 0, errors.NotFoundf("queue : %q , group: %q", queue, group)
 	}
 
-	owner := fmt.Sprintf("%s@%s", queue, group)
-	q.mu.Lock()
+	owner := queue + "@" + group
+	q.rw.RLock()
 	consumer, ok := q.consumerMap[owner]
+	q.rw.RUnlock()
 	if !ok {
-		consumer, err = kafka.NewConsumer(q.metadata.manager.BrokerAddrs(), q.clusterConfig, queue, group)
-		if err != nil {
-			q.mu.Unlock()
-			return "", nil, 0, errors.Trace(err)
+		q.rw.Lock()
+		consumer, ok = q.consumerMap[owner]
+		if !ok {
+			// 此处获取config跟之前ExistGroup并不是原子操作，存在并发风险
+			var err error
+			queueConfig := q.metadata.GetQueueConfig(queue)
+			brokerAddrs := q.metadata.GetBrokerAddrsByIdc(queueConfig.Idcs...)
+			consumer, err = kafka.NewConsumer(brokerAddrs, q.clusterConfig, queue, group)
+			if err != nil {
+				q.rw.Unlock()
+				metrics.AddMeter(metrics.CmdGetError+"."+metrics.Qps, 1)
+				log.Errorf("RecvMessage: new consumer error %v", err)
+				return "", nil, 0, err
+			}
+			q.consumerMap[owner] = consumer
 		}
-		q.consumerMap[owner] = consumer
+		q.rw.Unlock()
 	}
-	q.mu.Unlock()
 
-	msg, err := consumer.Recv()
+	msg, idc, err := consumer.Recv()
 	if err != nil {
-		return "", nil, 0, errors.Trace(err)
+		metrics.AddCounter(metrics.CmdGetMiss, 1)
+		return "", nil, 0, err
 	}
 
-	var sequenceID, flag uint64
+	var sequence, flag uint64
 	tokens := strings.Split(string(msg.Key), ":")
-	sequenceID, _ = strconv.ParseUint(tokens[0], 16, 64)
+	sequence, _ = strconv.ParseUint(tokens[0], 16, 64)
 	if len(tokens) > 1 {
 		flag, _ = strconv.ParseUint(tokens[1], 16, 32)
 	}
 
-	messageID := fmt.Sprintf("%x:%s:%s:%x:%x", sequenceID, queue, group, msg.Partition, msg.Offset)
+	msgId := messageId{
+		queue:     queue,
+		group:     group,
+		idc:       idc,
+		partition: msg.Partition,
+		offset:    msg.Offset,
+		sequence:  sequence,
+	}
+	messageID := msgId.String()
 
 	end := time.Now()
 	cost := end.Sub(start).Nanoseconds() / 1e6
-	delay := end.UnixNano()/1e6 - baseTime - int64((sequenceID>>24)&0xFFFFFFFFFF)
+	delay := end.UnixNano()/1e6 - baseTime - int64((sequence>>24)&0xFFFFFFFFFF)
 
-	metrics.Add(queue+"#"+group+"#recv", 1, cost, delay)
+	prefix := queue + "." + group + "." + metrics.CmdGet + "."
+	metrics.AddCounter(metrics.CmdGet, 1)
+	metrics.AddCounter(prefix+metrics.Ops, 1)
+	metrics.AddCounter(prefix+metrics.ElapseTimeString(cost), 1)
+	metrics.AddMeter(prefix+metrics.ElapseTimeString(cost)+"."+metrics.Qps, 1)
+	metrics.AddMeter(prefix+metrics.Qps, 1)
+	metrics.AddTimer(prefix+metrics.Latency, delay)
+	metrics.AddCounter(metrics.BytesRead, int64(len(msg.Value)))
 
 	log.Debugf("recv %s:%s key %s id %s cost %d delay %d", queue, group, string(msg.Key), messageID, cost, delay)
 	return messageID, msg.Value, flag, nil
 }
 
+// ACK 一条消息，ACK表明该ID的消息已经被client获取到，可以从清除
 func (q *queueImp) AckMessage(queue string, group string, id string) error {
-	start := time.Now()
 
+	start := time.Now()
 	if exist := q.metadata.ExistGroup(queue, group); !exist {
+		metrics.AddMeter(metrics.CmdAckError+"."+metrics.Qps, 1)
+		log.Errorf("AckMessage: queue %q group %q not found", queue, group)
 		return errors.NotFoundf("queue : %q , group: %q", queue, group)
 	}
 
-	owner := fmt.Sprintf("%s@%s", queue, group)
-	q.mu.Lock()
+	owner := queue + "@" + group
+	q.rw.RLock()
 	consumer, ok := q.consumerMap[owner]
-	q.mu.Unlock()
+	q.rw.RUnlock()
 	if !ok {
+		metrics.AddMeter(metrics.CmdAckError+"."+metrics.Qps, 1)
+		log.Errorf("AckMessage: queue %q group %q not found consumer", queue, group)
 		return errors.NotFoundf("group consumer")
 	}
 
-	tokens := strings.Split(id, ":")
-	if len(tokens) != 5 {
-		return errors.NotValidf("message ID : %q", id)
+	msgId := &messageId{}
+	if err := msgId.Parse(id); err != nil {
+		metrics.AddMeter(metrics.CmdAckError+"."+metrics.Qps, 1)
+		return errors.NotValidf("message id: %q", id)
 	}
 
-	partition, err := strconv.ParseInt(tokens[3], 16, 32)
-	if err != nil {
-		return errors.NotValidf("message ID : %q", id)
-	}
-	offset, err := strconv.ParseInt(tokens[4], 16, 64)
-	if err != nil {
-		return errors.NotValidf("message ID : %q", id)
-	}
-
-	err = consumer.Ack(int32(partition), offset)
-	if err != nil {
-		return errors.Trace(err)
+	if err := consumer.Ack(msgId.idc, msgId.partition, msgId.offset); err != nil {
+		metrics.AddMeter(metrics.CmdAckError+"."+metrics.Qps, 1)
+		return err
 	}
 
 	cost := time.Now().Sub(start).Nanoseconds() / 1e6
+	prefix := queue + "." + group + "." + metrics.CmdAck + "."
+	metrics.AddCounter(prefix+metrics.Ops, 1)
+	metrics.AddCounter(prefix+metrics.ElapseTimeString(cost), 1)
+	metrics.AddMeter(prefix+metrics.ElapseTimeString(cost)+"."+metrics.Qps, 1)
+	metrics.AddMeter(prefix+metrics.Qps, 1)
 	log.Debugf("ack %s:%s key nil id %s cost %d", queue, group, id, cost)
 	return nil
 }
 
-func (q *queueImp) GetSendMetrics(queue string, group string,
-	start int64, end int64, intervalnum int64) (metrics.MetricsObj, error) {
-
-	if exist := q.metadata.ExistGroup(queue, group); !exist {
-		return nil, errors.NotFoundf("GetSendMetrics queue : %q , group : %q", queue, group)
-	}
-
-	return q.monitor.GetSendMetrics(queue, group, start, end, intervalnum)
-}
-
-func (q *queueImp) GetReceiveMetrics(queue string, group string, start int64, end int64, intervalnum int64) (metrics.MetricsObj, error) {
-
-	if exist := q.metadata.ExistGroup(queue, group); !exist {
-		return nil, errors.NotFoundf("GetReceiveMetrics queue : %q , group : %q", queue, group)
-	}
-
-	return q.monitor.GetReceiveMetrics(queue, group, start, end, intervalnum)
-}
-
+// return all group's accumulation
 func (q *queueImp) AccumulationStatus() ([]AccumulationInfo, error) {
+
 	accumulationInfos := make([]AccumulationInfo, 0)
-	err := q.metadata.RefreshMetadata()
-	if err != nil {
+	if err := q.metadata.RefreshMetadata(); err != nil {
 		return nil, errors.Trace(err)
 	}
 
@@ -467,26 +510,116 @@ func (q *queueImp) AccumulationStatus() ([]AccumulationInfo, error) {
 	return accumulationInfos, nil
 }
 
-func (q *queueImp) Close() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+// return online proxys
+func (q *queueImp) Proxys() (map[string]string, error) {
+	return q.metadata.Proxys()
+}
 
-	err := q.producer.Close()
+// return given proxy config
+func (q *queueImp) GetProxyConfigByID(id int) (string, error) {
+	return q.metadata.GetProxyConfigByID(id)
+}
+
+// UpTime return queue running time(seconde) during queue start
+func (q *queueImp) UpTime() int64 {
+	return time.Since(q.uptime).Nanoseconds() / 1e9
+}
+
+// Version return queue's code version
+func (q *queueImp) Version() string {
+	return q.version
+}
+
+func (q *queueImp) clocked() {
+	ticker := time.NewTicker(clockTime)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			q.monitoring()
+		case <-q.dying:
+			return
+		}
+	}
+}
+
+func (q *queueImp) monitoring() {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+
+	numGc := stats.NumGC - q.numGc
+	gcPause := stats.PauseTotalNs - q.gcPause
+	q.numGc = stats.NumGC
+	q.gcPause = stats.PauseTotalNs
+
+	metrics.AddGauge(metrics.Gc, int64(numGc))
+	metrics.AddGauge(metrics.Goroutine, int64(runtime.NumGoroutine()))
+	metrics.AddGauge(metrics.MemAlloc, int64(stats.Alloc))
+
+	if numGc > 0 {
+		metrics.AddGauge(metrics.GcPauseAvg, int64(gcPause)/int64(numGc*1e3)) //time.Microsecond
+		if numGc > 256 {
+			numGc = 256
+		}
+		var max, min uint64
+		for i := uint32(0); i < numGc; i++ {
+			pause := stats.PauseNs[(stats.NumGC-i+255)%256]
+			if pause > max {
+				max = pause
+			}
+			if pause < min || i == 0 {
+				min = pause
+			}
+		}
+		metrics.AddGauge(metrics.GcPauseMin, int64(min/1e3))
+		metrics.AddGauge(metrics.GcPauseMax, int64(max/1e3))
+	}
+
+	// monitor for accumulations of all queues
+	accInfos, err := q.AccumulationStatus()
 	if err != nil {
+		log.Errorf("AccumulationStatus error %v", err)
+		return
+	}
+
+	for _, i := range accInfos {
+		metrics.AddGauge(i.Queue+"."+i.Group+"."+metrics.Accum, i.Total-i.Consumed)
+	}
+}
+
+// load metrics data from zookeeper
+func (q *queueImp) loadMetrics() error {
+	data, err := q.metadata.LoadMetrics()
+	if err != nil {
+		return err
+	}
+	return metrics.LoadDataFromBytes(data)
+}
+
+// save metrics data in zookeeper
+func (q *queueImp) saveMetrics() error {
+	return q.metadata.SaveMetrics(metrics.SaveDataToString())
+}
+
+// close the queue
+func (q *queueImp) Close() {
+	q.rw.RLock()
+	defer q.rw.RUnlock()
+
+	close(q.dying)
+
+	if err := q.saveMetrics(); err != nil {
+		log.Errorf("queue save metrics: %v", err)
+	}
+
+	if err := q.producer.Close(); err != nil {
 		log.Errorf("close producer err: %s", err)
 	}
 
 	for name, consumer := range q.consumerMap {
-		err = consumer.Close()
-		if err != nil {
-			log.Errorf("close consumer %s err: %s", name, err)
-		}
+		consumer.Close()
 		delete(q.consumerMap, name)
-	}
-
-	err = q.monitor.Close()
-	if err != nil {
-		log.Errorf("close monitor err: %s", err)
 	}
 
 	q.metadata.Close()

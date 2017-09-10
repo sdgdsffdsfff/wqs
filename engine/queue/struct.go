@@ -17,16 +17,45 @@ limitations under the License.
 package queue
 
 import (
+	"bytes"
 	"encoding/json"
 
 	"github.com/weibocom/wqs/config"
 )
 
 type QueueInfo struct {
-	Queue  string         `json:"queue"`
-	Ctime  int64          `json:"ctime"`
-	Length int64          `json:"length"`
-	Groups []*GroupConfig `json:"groups,omitempty"`
+	Queue  string        `json:"queue"`
+	Ctime  int64         `json:"ctime"`
+	Length int64         `json:"length"`
+	Groups []GroupConfig `json:"groups,omitempty"`
+}
+
+type queueInfoSlice []*QueueInfo
+
+func (q queueInfoSlice) Len() int {
+	return len(q)
+}
+
+func (q queueInfoSlice) Less(i, j int) bool {
+	return q[i].Queue < q[j].Queue
+}
+
+func (q queueInfoSlice) Swap(i, j int) {
+	q[i], q[j] = q[j], q[i]
+}
+
+type groupSlice []GroupConfig
+
+func (q groupSlice) Len() int {
+	return len(q)
+}
+
+func (q groupSlice) Less(i, j int) bool {
+	return q[i].Group < q[j].Group
+}
+
+func (q groupSlice) Swap(i, j int) {
+	q[i], q[j] = q[j], q[i]
 }
 
 type QueueConfig struct {
@@ -34,11 +63,38 @@ type QueueConfig struct {
 	Ctime  int64                  `json:"ctime"`
 	Length int64                  `json:"length"`
 	Groups map[string]GroupConfig `json:"groups,omitempty"`
+	Idcs   []string               `json:"idcs,omitempty"`
+}
+
+func (q *QueueConfig) String() string {
+	d, _ := json.Marshal(q)
+	return string(d)
+}
+
+func (q *QueueConfig) Parse(data []byte) error {
+	return json.Unmarshal(data, q)
+}
+
+type AccumulationInfo struct {
+	Group    string `json:"group,omitempty"`
+	Queue    string `json:"queue,omitempty"`
+	Total    int64  `json:"total,omitempty"`
+	Consumed int64  `json:"consumed,omitempty"`
 }
 
 type GroupInfo struct {
 	Group  string         `json:"group"`
 	Queues []*GroupConfig `json:"queues,omitempty"`
+}
+
+func (i *QueueInfo) String() string {
+	data, _ := json.Marshal(i)
+	return string(data)
+}
+
+func (i *GroupInfo) String() string {
+	data, _ := json.Marshal(i)
+	return string(data)
 }
 
 type GroupConfig struct {
@@ -50,34 +106,28 @@ type GroupConfig struct {
 	Ips   []string `json:"ips"`
 }
 
-type AccumulationInfo struct {
-	Group    string `json:"group,omitempty"`
-	Queue    string `json:"queue,omitempty"`
-	Total    int64  `json:"total,omitempty"`
-	Consumed int64  `json:"consumed,omitempty"`
+func (c *GroupConfig) Load(data []byte) error {
+	return json.Unmarshal(data, c)
 }
 
-func (queueInfo *QueueInfo) String() string {
-	result, _ := json.Marshal(queueInfo)
-	return string(result)
-}
-
-func (groupInfo *GroupInfo) String() string {
-	result, _ := json.Marshal(groupInfo)
-	return string(result)
-}
-
-func (groupConfig *GroupConfig) String() string {
-	result, _ := json.Marshal(groupConfig)
-	return string(result)
-}
-
-type ServiceInfo struct {
-	Host   string         `json:"host"`
-	Config *config.Config `json:"config"`
-}
-
-func (s *ServiceInfo) String() string {
-	data, _ := json.Marshal(s)
+func (c *GroupConfig) String() string {
+	data, _ := json.Marshal(c)
 	return string(data)
+}
+
+type proxyInfo struct {
+	Host   string `json:"host"`
+	Config string `json:"config"`
+	config *config.Config
+}
+
+func (i *proxyInfo) Load(data []byte) error {
+	return json.Unmarshal(data, i)
+}
+
+func (i *proxyInfo) String() string {
+	i.Config = i.config.String()
+	buff := &bytes.Buffer{}
+	json.NewEncoder(buff).Encode(i)
+	return buff.String()
 }

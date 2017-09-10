@@ -57,6 +57,14 @@ const (
 )
 
 const (
+	LogFatalS   = "fatal"
+	LogErrorS   = "error"
+	LogWarningS = "warning"
+	LogInfoS    = "info"
+	LogDebugS   = "debug"
+)
+
+const (
 	RollingDeny RollingType = iota
 	RollingByHour
 	RollingByDay
@@ -135,6 +143,10 @@ func genNextDay() (time.Time, time.Time) {
 		time.Date(year, month, day+1, 0, 0, 0, 0, time.Local)
 }
 
+func (l *Logger) GetLevel() uint32 {
+	return atomic.LoadUint32(&l.level)
+}
+
 func (l *Logger) SetRolling(t RollingType) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -207,6 +219,22 @@ func logLevel2String(t uint32) string {
 		return "[INFO]"
 	}
 	return "[UNKOWN]"
+}
+
+func LogLevel2String(level uint32) string {
+	switch level {
+	case LogFatal:
+		return "fatal"
+	case LogError:
+		return "error"
+	case LogDebug:
+		return "debug"
+	case LogWarning:
+		return "warning"
+	case LogInfo:
+		return "info"
+	}
+	return "unknow"
 }
 
 func (l *Logger) formatPrefix(buf *[]byte, flags uint32, t time.Time, file string, line int, level uint32) {
@@ -294,7 +322,7 @@ func (l *Logger) log(level uint32, args ...interface{}) {
 	l.Output(3, level, fmt.Sprint(args...))
 }
 
-func (l *Logger) logf(level uint32, format string, args ...interface{}) {
+func (l *Logger) logformat(level uint32, format string, args ...interface{}) {
 	if level > atomic.LoadUint32(&l.level) {
 		return
 	}
@@ -308,7 +336,7 @@ func (l *Logger) Fatal(args ...interface{}) {
 }
 
 func (l *Logger) Fatalf(format string, args ...interface{}) {
-	l.logf(LogFatal, format, args...)
+	l.logformat(LogFatal, format, args...)
 	l.Close()
 	os.Exit(-1)
 }
@@ -318,7 +346,7 @@ func (l *Logger) Error(args ...interface{}) {
 }
 
 func (l *Logger) Errorf(format string, args ...interface{}) {
-	l.logf(LogError, format, args...)
+	l.logformat(LogError, format, args...)
 }
 
 func (l *Logger) Warn(args ...interface{}) {
@@ -326,7 +354,7 @@ func (l *Logger) Warn(args ...interface{}) {
 }
 
 func (l *Logger) Warnf(format string, args ...interface{}) {
-	l.logf(LogWarning, format, args...)
+	l.logformat(LogWarning, format, args...)
 }
 
 func (l *Logger) Debug(args ...interface{}) {
@@ -334,7 +362,7 @@ func (l *Logger) Debug(args ...interface{}) {
 }
 
 func (l *Logger) Debugf(format string, args ...interface{}) {
-	l.logf(LogDebug, format, args...)
+	l.logformat(LogDebug, format, args...)
 }
 
 func (l *Logger) Info(args ...interface{}) {
@@ -342,5 +370,5 @@ func (l *Logger) Info(args ...interface{}) {
 }
 
 func (l *Logger) Infof(format string, args ...interface{}) {
-	l.logf(LogInfo, format, args...)
+	l.logformat(LogInfo, format, args...)
 }

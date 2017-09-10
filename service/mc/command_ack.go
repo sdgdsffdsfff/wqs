@@ -24,72 +24,116 @@ import (
 	"strings"
 
 	"github.com/weibocom/wqs/engine/queue"
-
-	"github.com/juju/errors"
 )
 
 const (
-	ACK_NAME = "ack"
+	cmdEack = "eack"
+	cmdAck  = "ack"
 )
 
 func init() {
-	registerCommand(ACK_NAME, commandACK)
+	registerCommand(cmdAck, commandAck)
+	registerCommand(cmdEack, commandEack)
 }
 
-func commandACK(q queue.Queue, tokens []string, r *bufio.Reader, w *bufio.Writer) error {
+func commandAck(q queue.Queue, tokens []string, r *bufio.Reader, w *bufio.Writer) bool {
 
-	var noreply string
+	noreply := false
+	fields := len(tokens)
+	if fields != 3 && fields != 4 {
+		w.WriteString(respClientErrorBadCmdFormat)
+		return true
+	}
 
+	if fields == 4 {
+		if tokens[3] != noReply {
+			w.WriteString(respClientErrorBadCmdFormat)
+			return true
+		}
+		noreply = true
+	}
+
+	keys := strings.SplitN(tokens[1], ".", 2)
+	group := defaultGroup
+	queue := keys[0]
+	if len(keys) == 2 {
+		group = keys[0]
+		queue = keys[1]
+	}
+
+	if err := q.AckMessage(queue, group, tokens[2]); err != nil {
+		fmt.Fprintf(w, "%s %s\r\n", respEngineErrorPrefix, err)
+		return false
+	}
+
+	if noreply {
+		return false
+	}
+
+	w.WriteString(respStored)
+	return false
+}
+
+func commandEack(q queue.Queue, tokens []string, r *bufio.Reader, w *bufio.Writer) bool {
+
+	noreply := false
 	fields := len(tokens)
 	if fields != 5 && fields != 6 {
-		fmt.Fprint(w, CLIENT_ERROR_BADCMD_FORMAT)
-		return errors.NotValidf("mc tokens %v ", tokens)
+		w.WriteString(respClientErrorBadCmdFormat)
+		return true
 	}
 
 	key := tokens[1]
 	if fields == 6 {
-		noreply = tokens[5]
+		if tokens[5] != noReply {
+			w.WriteString(respClientErrorBadCmdFormat)
+			return true
+		}
+		noreply = true
 	}
 
 	// for ack command, flag is unused
 	_, err := strconv.ParseUint(tokens[2], 10, 32)
 	if err != nil {
-		fmt.Fprint(w, CLIENT_ERROR_BADCMD_FORMAT)
-		return errors.Trace(err)
+		w.WriteString(respClientErrorBadCmdFormat)
+		return true
 	}
 
 	length, err := strconv.ParseUint(tokens[4], 10, 32)
 	if err != nil {
-		fmt.Fprint(w, CLIENT_ERROR_BADCMD_FORMAT)
-		return errors.Trace(err)
+		w.WriteString(respClientErrorBadCmdFormat)
+		return true
 	}
 
-	id := make([]byte, length)
-	_, err = io.ReadAtLeast(r, id, int(length))
+	id := make([]byte, length+2)
+	_, err = io.ReadAtLeast(r, id, int(length)+2)
 	if err != nil {
-		fmt.Fprint(w, CLIENT_ERROR_BAD_DATACHUNK)
-		return errors.Trace(err)
+		w.WriteString(respClientErrorBadDatachunk)
+		return true
 	}
-	r.ReadString('\n')
+	if id[length] != '\r' || id[length+1] != '\n' {
+		w.WriteString(respClientErrorBadDatachunk)
+		return true
+	}
 
-	keys := strings.Split(key, ".")
+	id = id[:length]
+	keys := strings.SplitN(key, ".", 2)
 	group := defaultGroup
 	queue := keys[0]
-	if len(keys) > 1 {
+	if len(keys) == 2 {
 		group = keys[0]
 		queue = keys[1]
 	}
 
-	err = q.AckMessage(queue, group, string(id))
-	if err != nil {
-		fmt.Fprintf(w, "%s %s\r\n", ENGINE_ERROR_PREFIX, err)
-		return nil
+	if err = q.AckMessage(queue, group, string(id)); err != nil {
+		fmt.Fprintf(w, "%s %s\r\n", respEngineErrorPrefix, err)
+		return false
 	}
 
-	if NOREPLY == noreply {
-		return nil
+	if noreply {
+		return false
 	}
 
-	fmt.Fprint(w, STORED)
-	return nil
+	w.WriteString(respStored)
+	return false
 }

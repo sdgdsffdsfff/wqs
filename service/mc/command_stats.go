@@ -19,37 +19,64 @@ package mc
 import (
 	"bufio"
 	"fmt"
-	"strings"
+	"os"
+	"runtime"
+	"syscall"
+	"time"
+	"unsafe"
 
 	"github.com/weibocom/wqs/engine/queue"
-
-	"github.com/juju/errors"
+	"github.com/weibocom/wqs/metrics"
 )
 
 const (
-	STATS_NAME = "stats"
+	cmdStats = "stats"
 )
 
 func init() {
-	registerCommand(STATS_NAME, commandStats)
+	registerCommand(cmdStats, commandStats)
 }
 
-func commandStats(q queue.Queue, tokens []string, r *bufio.Reader, w *bufio.Writer) error {
+func commandStats(q queue.Queue, tokens []string, r *bufio.Reader, w *bufio.Writer) bool {
 
 	fields := len(tokens)
 	if fields != 1 && fields != 2 {
-		fmt.Fprint(w, CLIENT_ERROR_BADCMD_FORMAT)
-		return errors.NotValidf("mc tokens %v ", tokens)
+		w.WriteString(respClientErrorBadCmdFormat)
+		return true
 	}
 
 	if fields == 1 {
-		// TODO: implement stats command
-		fmt.Fprint(w, END)
-	} else if fields == 2 && strings.EqualFold(tokens[1], "queue") {
+		var rusage syscall.Rusage
+		syscall.Getrusage(0, &rusage)
+		getHits := metrics.GetCounter(metrics.CmdGet)
+		getMiss := metrics.GetCounter(metrics.CmdGetMiss)
+		setHits := metrics.GetCounter(metrics.CmdSet)
+		setMiss := metrics.GetCounter(metrics.CmdSetError)
+		conns := metrics.GetCounter(metrics.ReConn)
+
+		fmt.Fprintf(w, "STAT pid %d\r\n", os.Getpid())
+		fmt.Fprintf(w, "STAT uptime %d\r\n", q.UpTime())
+		fmt.Fprintf(w, "STAT time %d\r\n", time.Now().Unix())
+		fmt.Fprintf(w, "STAT version %s\r\n", q.Version())
+		fmt.Fprintf(w, "STAT pointer_size %d\r\n", unsafe.Sizeof(r)*8)
+		fmt.Fprintf(w, "STAT rusage_user %d.%06d\r\n", rusage.Utime.Sec, rusage.Utime.Usec)
+		fmt.Fprintf(w, "STAT rusage_system %d.%06d\r\n", rusage.Stime.Sec, rusage.Stime.Usec)
+		fmt.Fprintf(w, "STAT curr_connections %d\r\n", conns)
+		fmt.Fprintf(w, "STAT total_connections %d\r\n", metrics.GetCounter(metrics.ToConn))
+		fmt.Fprintf(w, "STAT connection_structures %d\r\n", conns)
+		fmt.Fprintf(w, "STAT get_cmds %d\r\n", getHits+getMiss)
+		fmt.Fprintf(w, "STAT get_hits %d\r\n", getHits)
+		fmt.Fprintf(w, "STAT set_cmds %d\r\n", setHits+setMiss)
+		fmt.Fprintf(w, "STAT set_hits %d\r\n", setHits)
+		fmt.Fprintf(w, "STAT bytes_read %d\r\n", metrics.GetCounter(metrics.BytesRead))
+		fmt.Fprintf(w, "STAT bytes_written %d\r\n", metrics.GetCounter(metrics.BytesWriten))
+		fmt.Fprintf(w, "STAT threads %d\r\n", runtime.NumGoroutine())
+		fmt.Fprint(w, respEnd)
+	} else if fields == 2 && tokens[1] == "queue" {
 		accumulationInfos, err := q.AccumulationStatus()
 		if err != nil {
-			fmt.Fprintf(w, "%s %s\r\n", ENGINE_ERROR_PREFIX, err)
-			return nil
+			fmt.Fprintf(w, "%s %s\r\n", respEngineErrorPrefix, err)
+			return false
 		}
 		for _, accumulationInfo := range accumulationInfos {
 			fmt.Fprintf(w, "%s %s.%s %d/%d \r\n", "STAT",
@@ -58,9 +85,9 @@ func commandStats(q queue.Queue, tokens []string, r *bufio.Reader, w *bufio.Writ
 				accumulationInfo.Total,
 				accumulationInfo.Consumed)
 		}
-		fmt.Fprint(w, END)
+		fmt.Fprint(w, respEnd)
 	} else {
-		fmt.Fprint(w, ERROR)
+		w.WriteString(respError)
 	}
-	return nil
+	return false
 }
